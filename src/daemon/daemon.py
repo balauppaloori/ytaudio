@@ -68,12 +68,17 @@ def fetch_pending_jobs(client: httpx.Client) -> list[dict]:
     return data.get("jobs", [])
 
 
+COOKIES_FILE = os.environ.get("YTAUDIO_COOKIES_FILE", "/workspace/secrets/youtube-cookies.txt")
+
+YDL_BASE = {
+    "quiet": True,
+    "no_warnings": True,
+    **({"cookiefile": COOKIES_FILE} if os.path.exists(COOKIES_FILE) else {}),
+}
+
+
 def ydl_opts_info(extra: dict = None) -> dict:
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": False,
-    }
+    opts = {**YDL_BASE, "extract_flat": False}
     if extra:
         opts.update(extra)
     return opts
@@ -88,7 +93,7 @@ def process_video_job(client: httpx.Client, job: dict):
 
     # --- Fetch metadata ---
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+        with yt_dlp.YoutubeDL({**YDL_BASE}) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
         patch_job(client, job_id, status="error", error=f"Failed to fetch info: {e}")
@@ -131,6 +136,7 @@ def process_video_job(client: httpx.Client, job: dict):
                     pass
 
         ydl_download_opts = {
+            **YDL_BASE,
             "format": "bestaudio/best",
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
@@ -138,8 +144,6 @@ def process_video_job(client: httpx.Client, job: dict):
                 "preferredquality": "128",
             }],
             "outtmpl": str(AUDIO_DIR / f"{video_id}.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
             "progress_hooks": [progress_hook],
         }
         try:
@@ -197,7 +201,7 @@ def process_channel_job(client: httpx.Client, job: dict):
     patch_job(client, job_id, status="running", progress=5, current_step="Scanning channel")
 
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "extract_flat": True}) as ydl:
+        with yt_dlp.YoutubeDL({**YDL_BASE, "extract_flat": True}) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
         patch_job(client, job_id, status="error", error=f"Failed to scan channel: {e}")
