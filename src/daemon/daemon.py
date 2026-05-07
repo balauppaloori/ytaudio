@@ -5,14 +5,13 @@ Runs as a persistent background service.
 """
 
 import os
+import re
 import sys
 import time
 import json
 import logging
-import tempfile
 import subprocess
 from pathlib import Path
-from datetime import datetime
 
 import httpx
 import yt_dlp
@@ -23,6 +22,8 @@ WORKER_SECRET = os.environ.get("YTAUDIO_WORKER_SECRET", "ytaudio-internal-2026")
 AUDIO_DIR = Path(os.environ.get("YTAUDIO_AUDIO_DIR", "/workspace/projects/ytaudio/audio"))
 WHISPER_MODEL = os.environ.get("YTAUDIO_WHISPER_MODEL", "medium")
 POLL_INTERVAL = int(os.environ.get("YTAUDIO_POLL_INTERVAL", "5"))
+COOKIES_FILE = os.environ.get("YTAUDIO_COOKIES_FILE", "/workspace/secrets/youtube-cookies.txt")
+VENV_PYTHON = os.environ.get("YTAUDIO_VENV_PYTHON", "/home/bala/ytaudio-env/bin/python")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,25 +65,90 @@ def upsert_track(client: httpx.Client, track: dict):
 
 def fetch_pending_jobs(client: httpx.Client) -> list[dict]:
     r = client.get(f"{WORKER_URL}/jobs?status=queued")
-    data = r.json()
-    return data.get("jobs", [])
+    return r.json().get("jobs", [])
 
 
-COOKIES_FILE = os.environ.get("YTAUDIO_COOKIES_FILE", "/workspace/secrets/youtube-cookies.txt")
-
-YDL_BASE = {
-    "quiet": True,
-    "no_warnings": True,
-    **({"cookiefile": COOKIES_FILE} if os.path.exists(COOKIES_FILE) else {}),
-}
-
-
-def ydl_opts_info(extra: dict = None) -> dict:
-    opts = {**YDL_BASE, "extract_flat": False}
-    if extra:
-        opts.update(extra)
+def ydl_base() -> dict:
+    opts = {"quiet": True, "no_warnings": True}
+    if os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
     return opts
 
+
+# ── Auth job ──────────────────────────────────────────────────────────────────
+
+def process_auth_job(client: httpx.Client, job: dict):
+    """
+    Runs yt-dlp's device OAuth flow. Captures the Google device URL + code
+    from yt-dlp output and writes them to the job's current_step so the
+    frontend can display them. Waits up to 5 minutes for the user to approve.
+    """
+    job_id = job["id"]
+    log.info(f"[{job_id}] Starting YouTube OAuth device flow")
+
+    patch_job(client, job_id, status="running", progress=10,
+              current_step="Starting YouTube authentication…")
+
+    cmd = [
+        VENV_PYTHON, "-m", "yt_dlp",
+        "--username", "oauth2",
+        "--password", "",
+        "--skip-download",
+        "--no-playlist",
+        "--verbose",
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    ]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    auth_url = None
+    auth_code = None
+    timeout = 300  # 5 minutes
+    start = time.time()
+
+    for line in proc.stdout:
+        line = line.rstrip()
+        log.info(f"[{job_id}] yt-dlp: {line}")
+
+        if time.time() - start > timeout:
+            proc.kill()
+            patch_job(client, job_id, status="error", error="Auth timed out — no approval within 5 minutes")
+            return
+
+        # Parse device URL — yt-dlp prints something like:
+        # "To sign in, use a web browser to open the page https://www.google.com/device and enter the code XXXX-XXXX"
+        if not auth_url:
+            url_match = re.search(r'https://(?:accounts\.google\.com/device|www\.google\.com/device)', line)
+            if url_match:
+                auth_url = url_match.group(0)
+
+        if not auth_code:
+            code_match = re.search(r'\b([A-Z0-9]{4}-[A-Z0-9]{4})\b', line)
+            if code_match:
+                auth_code = code_match.group(1)
+
+        if auth_url and auth_code:
+            step = f"AWAITING_AUTH:{json.dumps({'url': auth_url, 'code': auth_code})}"
+            patch_job(client, job_id, progress=50, current_step=step)
+
+    proc.wait()
+
+    if proc.returncode == 0:
+        patch_job(client, job_id, status="done", progress=100,
+                  current_step="YouTube account connected — downloads will now work!")
+        log.info(f"[{job_id}] YouTube OAuth complete")
+    else:
+        patch_job(client, job_id, status="error",
+                  error="Authentication failed. Try again or check yt-dlp logs.")
+
+
+# ── Video job ─────────────────────────────────────────────────────────────────
 
 def process_video_job(client: httpx.Client, job: dict):
     job_id = job["id"]
@@ -91,9 +157,8 @@ def process_video_job(client: httpx.Client, job: dict):
 
     patch_job(client, job_id, status="running", progress=5, current_step="Fetching video info")
 
-    # --- Fetch metadata ---
     try:
-        with yt_dlp.YoutubeDL({**YDL_BASE}) as ydl:
+        with yt_dlp.YoutubeDL({**ydl_base()}) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
         patch_job(client, job_id, status="error", error=f"Failed to fetch info: {e}")
@@ -118,7 +183,6 @@ def process_video_job(client: httpx.Client, job: dict):
 
     patch_job(client, job_id, progress=15, current_step="Downloading audio")
 
-    # --- Download audio ---
     audio_path = AUDIO_DIR / f"{video_id}.mp3"
     if not audio_path.exists():
         progress_state = {"pct": 15}
@@ -131,23 +195,23 @@ def process_video_job(client: httpx.Client, job: dict):
                     overall = int(15 + dl_pct * 0.35)
                     if overall != progress_state["pct"]:
                         progress_state["pct"] = overall
-                        patch_job(client, job_id, progress=overall, current_step=f"Downloading audio {dl_pct:.0f}%")
+                        patch_job(client, job_id, progress=overall,
+                                  current_step=f"Downloading audio {dl_pct:.0f}%")
                 except ValueError:
                     pass
 
-        ydl_download_opts = {
-            **YDL_BASE,
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "128",
-            }],
-            "outtmpl": str(AUDIO_DIR / f"{video_id}.%(ext)s"),
-            "progress_hooks": [progress_hook],
-        }
         try:
-            with yt_dlp.YoutubeDL(ydl_download_opts) as ydl:
+            with yt_dlp.YoutubeDL({
+                **ydl_base(),
+                "format": "bestaudio/best",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "128",
+                }],
+                "outtmpl": str(AUDIO_DIR / f"{video_id}.%(ext)s"),
+                "progress_hooks": [progress_hook],
+            }) as ydl:
                 ydl.download([url])
         except Exception as e:
             patch_job(client, job_id, status="error", error=f"Download failed: {e}")
@@ -161,7 +225,6 @@ def process_video_job(client: httpx.Client, job: dict):
 
     patch_job(client, job_id, progress=50, current_step="Transcribing audio (this may take a while)")
 
-    # --- Transcribe ---
     try:
         model = get_model()
         result = model.transcribe(str(audio_path), verbose=False)
@@ -173,8 +236,7 @@ def process_video_job(client: httpx.Client, job: dict):
 
     patch_job(client, job_id, progress=90, current_step="Saving to library")
 
-    # --- Save track ---
-    track = {
+    upsert_track(client, {
         "id": video_id,
         "channel_id": channel_id,
         "title": title,
@@ -186,12 +248,14 @@ def process_video_job(client: httpx.Client, job: dict):
         "transcript": transcript,
         "audio_filename": audio_path.name,
         "status": "done",
-    }
-    upsert_track(client, track)
+    })
 
-    patch_job(client, job_id, status="done", progress=100, current_step="Complete", track_id=video_id, channel_id=channel_id)
+    patch_job(client, job_id, status="done", progress=100, current_step="Complete",
+              track_id=video_id, channel_id=channel_id)
     log.info(f"[{job_id}] Done: {title}")
 
+
+# ── Channel job ───────────────────────────────────────────────────────────────
 
 def process_channel_job(client: httpx.Client, job: dict):
     job_id = job["id"]
@@ -201,7 +265,7 @@ def process_channel_job(client: httpx.Client, job: dict):
     patch_job(client, job_id, status="running", progress=5, current_step="Scanning channel")
 
     try:
-        with yt_dlp.YoutubeDL({**YDL_BASE, "extract_flat": True}) as ydl:
+        with yt_dlp.YoutubeDL({**ydl_base(), "extract_flat": True}) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
         patch_job(client, job_id, status="error", error=f"Failed to scan channel: {e}")
@@ -217,7 +281,6 @@ def process_channel_job(client: httpx.Client, job: dict):
     entries = info.get("entries") or []
     total = len(entries)
     log.info(f"[{job_id}] Found {total} videos in channel")
-
     patch_job(client, job_id, progress=10, current_step=f"Found {total} videos — queuing jobs")
 
     for i, entry in enumerate(entries):
@@ -226,27 +289,28 @@ def process_channel_job(client: httpx.Client, job: dict):
         video_id = entry.get("id")
         if not video_id:
             continue
-        video_url = f"https://www.youtube.com/watch?v={video_id}"
-        # Create individual video job
         client.post(f"{WORKER_URL}/jobs", json={
             "type": "transcribe_video",
-            "input_url": video_url,
+            "input_url": f"https://www.youtube.com/watch?v={video_id}",
         }, headers={"Content-Type": "application/json"})
         pct = int(10 + (i / total) * 85)
         patch_job(client, job_id, progress=pct, current_step=f"Queued {i+1}/{total} videos")
 
-    patch_job(client, job_id, status="done", progress=100, current_step=f"All {total} videos queued", channel_id=channel_id)
+    patch_job(client, job_id, status="done", progress=100,
+              current_step=f"All {total} videos queued", channel_id=channel_id)
     log.info(f"[{job_id}] Channel scan complete: {total} videos queued")
 
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
 
 def run():
     log.info("ytaudio daemon starting up")
     log.info(f"Worker URL: {WORKER_URL}")
     log.info(f"Audio dir: {AUDIO_DIR}")
     log.info(f"Whisper model: {WHISPER_MODEL}")
+    log.info(f"Cookies file: {'found' if os.path.exists(COOKIES_FILE) else 'not found'}")
 
     with httpx.Client(timeout=60) as client:
-        # Eagerly load whisper model so first job is fast
         log.info("Pre-loading Whisper model...")
         try:
             get_model()
@@ -265,8 +329,11 @@ def run():
                         process_video_job(client, job)
                     elif job["type"] == "transcribe_channel":
                         process_channel_job(client, job)
+                    elif job["type"] == "youtube_auth":
+                        process_auth_job(client, job)
                     else:
-                        patch_job(client, job["id"], status="error", error=f"Unknown job type: {job['type']}")
+                        patch_job(client, job["id"], status="error",
+                                  error=f"Unknown job type: {job['type']}")
             except KeyboardInterrupt:
                 log.info("Daemon stopped.")
                 break

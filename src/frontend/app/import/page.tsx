@@ -1,16 +1,28 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { Link2, Video, Tv2, CheckCircle, AlertCircle, Loader2 } from "lucide-react";
+import { Link2, Video, Tv2, CheckCircle, AlertCircle, Loader2, ShieldCheck, ExternalLink } from "lucide-react";
 import { createJob, getJob, parseYouTubeInput } from "@/lib/api";
 import type { Job } from "@/lib/api";
 
 interface ActiveJob {
   id: string;
   inputUrl: string;
-  videoId?: string;
-  videoTitle?: string;
-  type: "video" | "channel";
+  type: "video" | "channel" | "auth";
+}
+
+interface AuthInfo {
+  url: string;
+  code: string;
+}
+
+function parseAuthStep(step: string | null): AuthInfo | null {
+  if (!step?.startsWith("AWAITING_AUTH:")) return null;
+  try {
+    return JSON.parse(step.slice("AWAITING_AUTH:".length));
+  } catch {
+    return null;
+  }
 }
 
 export default function ImportPage() {
@@ -28,7 +40,6 @@ export default function ImportPage() {
     setParseError(url.trim().length > 5 && !result);
   }, [url]);
 
-  // Poll active jobs
   useEffect(() => {
     if (activeJobs.length === 0) return;
     const poll = async () => {
@@ -50,10 +61,19 @@ export default function ImportPage() {
     setSubmitting(true);
     try {
       const type = parsed.type === "video" ? "transcribe_video" : "transcribe_channel";
-      const inputUrl = url.trim();
-      const jobId = await createJob(type, inputUrl);
-      setActiveJobs((prev) => [...prev, { id: jobId, inputUrl, type: parsed.type, videoId: parsed.type === "video" ? parsed.id : undefined }]);
+      const jobId = await createJob(type, url.trim());
+      setActiveJobs((prev) => [...prev, { id: jobId, inputUrl: url.trim(), type: parsed.type }]);
       setUrl("");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleConnectYouTube() {
+    setSubmitting(true);
+    try {
+      const jobId = await createJob("youtube_auth", "https://www.youtube.com");
+      setActiveJobs((prev) => [...prev, { id: jobId, inputUrl: "YouTube account", type: "auth" }]);
     } finally {
       setSubmitting(false);
     }
@@ -95,7 +115,6 @@ export default function ImportPage() {
         </button>
       </div>
 
-      {/* URL type indicator */}
       {parsed && (
         <div className="mt-2 flex items-center gap-1.5 text-xs text-gray-400">
           {parsed.type === "video"
@@ -120,16 +139,31 @@ export default function ImportPage() {
         </div>
       )}
 
+      {/* Connect YouTube account */}
+      <div className="mt-8 border border-amber-100 bg-amber-50 rounded-xl p-4 flex items-start gap-3">
+        <ShieldCheck className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium text-amber-800">YouTube authentication required</p>
+          <p className="text-xs text-amber-600 mt-0.5">
+            Downloads from server IPs require a connected Google account. Click below to sign in — you&apos;ll get a short code to approve on any device.
+          </p>
+        </div>
+        <button
+          onClick={handleConnectYouTube}
+          disabled={submitting}
+          className="flex-shrink-0 px-3 py-1.5 rounded-lg bg-amber-500 text-white text-xs font-medium hover:bg-amber-600 transition-colors disabled:opacity-40 flex items-center gap-1.5"
+        >
+          {submitting ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+          Connect
+        </button>
+      </div>
+
       {/* Active jobs */}
       {activeJobs.length > 0 && (
-        <div className="mt-8 flex flex-col gap-3">
+        <div className="mt-6 flex flex-col gap-3">
           <h2 className="text-sm font-medium text-gray-700">Progress</h2>
           {activeJobs.map((aj) => (
-            <JobCard
-              key={aj.id}
-              activeJob={aj}
-              job={jobStatuses[aj.id] ?? null}
-            />
+            <JobCard key={aj.id} activeJob={aj} job={jobStatuses[aj.id] ?? null} />
           ))}
         </div>
       )}
@@ -141,6 +175,7 @@ function JobCard({ activeJob, job }: { activeJob: ActiveJob; job: Job | null }) 
   const status = job?.status ?? "queued";
   const progress = job?.progress ?? 0;
   const step = job?.current_step ?? "Queued…";
+  const authInfo = parseAuthStep(step);
 
   return (
     <div className="border border-gray-100 rounded-xl p-4 bg-gray-50">
@@ -165,8 +200,35 @@ function JobCard({ activeJob, job }: { activeJob: ActiveJob; job: Job | null }) 
         </span>
       </div>
 
-      {/* Progress bar */}
-      {status !== "done" && status !== "error" && (
+      {/* Auth flow UI */}
+      {authInfo && (
+        <div className="bg-white border border-amber-200 rounded-lg p-4 mb-2">
+          <p className="text-sm font-medium text-gray-800 mb-3">
+            Open this URL on any device and enter the code:
+          </p>
+          <a
+            href={authInfo.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-2 text-blue-600 hover:underline text-sm mb-3"
+          >
+            <ExternalLink className="w-4 h-4" />
+            {authInfo.url}
+          </a>
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-gray-500">Enter code:</span>
+            <span className="font-mono text-xl font-bold tracking-widest text-gray-900 bg-gray-100 px-3 py-1 rounded">
+              {authInfo.code}
+            </span>
+          </div>
+          <p className="text-xs text-gray-400 mt-3">
+            Waiting for approval… this page updates automatically.
+          </p>
+        </div>
+      )}
+
+      {/* Progress bar (not for auth waiting state) */}
+      {status !== "done" && status !== "error" && !authInfo && (
         <div className="mb-2">
           <div className="h-1.5 bg-gray-200 rounded-full overflow-hidden">
             <div
@@ -182,20 +244,17 @@ function JobCard({ activeJob, job }: { activeJob: ActiveJob; job: Job | null }) 
       )}
 
       {status === "done" && job?.track_id && (
-        <a
-          href={`/track?id=${job.track_id}`}
-          className="text-xs text-blue-500 hover:underline"
-        >
+        <a href={`/track?id=${job.track_id}`} className="text-xs text-blue-500 hover:underline">
           View transcript →
         </a>
       )}
-
+      {status === "done" && activeJob.type === "auth" && (
+        <p className="text-xs text-green-600 font-medium">
+          ✓ YouTube connected — you can now import videos
+        </p>
+      )}
       {status === "error" && job?.error && (
         <p className="text-xs text-red-400 mt-1">{job.error}</p>
-      )}
-
-      {activeJob.type === "channel" && status === "running" && (
-        <p className="text-xs text-gray-400 mt-1">Scanning channel and queuing videos…</p>
       )}
     </div>
   );
