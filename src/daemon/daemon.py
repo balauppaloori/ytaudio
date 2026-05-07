@@ -5,12 +5,9 @@ Runs as a persistent background service.
 """
 
 import os
-import re
 import sys
 import time
-import json
 import logging
-import subprocess
 from pathlib import Path
 
 import httpx
@@ -68,84 +65,27 @@ def fetch_pending_jobs(client: httpx.Client) -> list[dict]:
     return r.json().get("jobs", [])
 
 
+def sync_cookies(client: httpx.Client):
+    """Fetch cookies from D1 via Worker and write to local file."""
+    try:
+        r = client.get(f"{WORKER_URL}/settings/youtube-cookies", headers=headers())
+        data = r.json()
+        cookies = data.get("cookies")
+        if cookies:
+            Path(COOKIES_FILE).parent.mkdir(parents=True, exist_ok=True)
+            Path(COOKIES_FILE).write_text(cookies)
+            log.info("YouTube cookies synced from D1")
+        else:
+            log.info("No YouTube cookies stored in D1 yet")
+    except Exception as e:
+        log.warning(f"Could not sync cookies: {e}")
+
+
 def ydl_base() -> dict:
     opts = {"quiet": True, "no_warnings": True}
     if os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
     return opts
-
-
-# ── Auth job ──────────────────────────────────────────────────────────────────
-
-def process_auth_job(client: httpx.Client, job: dict):
-    """
-    Runs yt-dlp's device OAuth flow. Captures the Google device URL + code
-    from yt-dlp output and writes them to the job's current_step so the
-    frontend can display them. Waits up to 5 minutes for the user to approve.
-    """
-    job_id = job["id"]
-    log.info(f"[{job_id}] Starting YouTube OAuth device flow")
-
-    patch_job(client, job_id, status="running", progress=10,
-              current_step="Starting YouTube authentication…")
-
-    cmd = [
-        VENV_PYTHON, "-m", "yt_dlp",
-        "--username", "oauth2",
-        "--password", "",
-        "--skip-download",
-        "--no-playlist",
-        "--verbose",
-        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    ]
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
-    auth_url = None
-    auth_code = None
-    timeout = 300  # 5 minutes
-    start = time.time()
-
-    for line in proc.stdout:
-        line = line.rstrip()
-        log.info(f"[{job_id}] yt-dlp: {line}")
-
-        if time.time() - start > timeout:
-            proc.kill()
-            patch_job(client, job_id, status="error", error="Auth timed out — no approval within 5 minutes")
-            return
-
-        # Parse device URL — yt-dlp prints something like:
-        # "To sign in, use a web browser to open the page https://www.google.com/device and enter the code XXXX-XXXX"
-        if not auth_url:
-            url_match = re.search(r'https://(?:accounts\.google\.com/device|www\.google\.com/device)', line)
-            if url_match:
-                auth_url = url_match.group(0)
-
-        if not auth_code:
-            code_match = re.search(r'\b([A-Z0-9]{4}-[A-Z0-9]{4})\b', line)
-            if code_match:
-                auth_code = code_match.group(1)
-
-        if auth_url and auth_code:
-            step = f"AWAITING_AUTH:{json.dumps({'url': auth_url, 'code': auth_code})}"
-            patch_job(client, job_id, progress=50, current_step=step)
-
-    proc.wait()
-
-    if proc.returncode == 0:
-        patch_job(client, job_id, status="done", progress=100,
-                  current_step="YouTube account connected — downloads will now work!")
-        log.info(f"[{job_id}] YouTube OAuth complete")
-    else:
-        patch_job(client, job_id, status="error",
-                  error="Authentication failed. Try again or check yt-dlp logs.")
 
 
 # ── Video job ─────────────────────────────────────────────────────────────────
@@ -311,6 +251,8 @@ def run():
     log.info(f"Cookies file: {'found' if os.path.exists(COOKIES_FILE) else 'not found'}")
 
     with httpx.Client(timeout=60) as client:
+        sync_cookies(client)
+
         log.info("Pre-loading Whisper model...")
         try:
             get_model()
@@ -329,8 +271,6 @@ def run():
                         process_video_job(client, job)
                     elif job["type"] == "transcribe_channel":
                         process_channel_job(client, job)
-                    elif job["type"] == "youtube_auth":
-                        process_auth_job(client, job)
                     else:
                         patch_job(client, job["id"], status="error",
                                   error=f"Unknown job type: {job['type']}")

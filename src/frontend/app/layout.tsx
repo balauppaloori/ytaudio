@@ -28,6 +28,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <Link href="/jobs" className="text-sm text-gray-500 hover:text-gray-900 transition-colors">
               Jobs
             </Link>
+            <Link href="/connect" className="text-sm text-gray-500 hover:text-gray-900 transition-colors ml-auto flex items-center gap-1">
+              Connect YouTube
+            </Link>
           </nav>
         </header>
         <main className="flex-1">{children}</main>

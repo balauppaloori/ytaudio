@@ -250,6 +250,36 @@ export default {
         return json(data);
       }
 
+      // --- SETTINGS (youtube cookies) ---
+      if (path === "/settings/youtube-cookies" && method === "GET") {
+        // Only the daemon (with secret) can read raw cookies
+        if (!requireSecret(request, env)) return err("Unauthorized", 401);
+        const row = await env.DB.prepare(
+          `SELECT value FROM settings WHERE key = 'youtube_cookies'`
+        ).first<{ value: string }>();
+        if (!row) return json({ cookies: null });
+        return json({ cookies: row.value });
+      }
+
+      if (path === "/settings/youtube-cookies" && method === "POST") {
+        if (!requireSecret(request, env)) return err("Unauthorized", 401);
+        const body = await request.json() as { cookies: string };
+        if (!body.cookies?.trim()) return err("cookies field required");
+        await env.DB.prepare(`
+          INSERT INTO settings (key, value, updated_at)
+          VALUES ('youtube_cookies', ?, CURRENT_TIMESTAMP)
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+        `).bind(body.cookies.trim()).run();
+        return json({ ok: true });
+      }
+
+      if (path === "/settings/youtube-cookies/status" && method === "GET") {
+        const row = await env.DB.prepare(
+          `SELECT updated_at FROM settings WHERE key = 'youtube_cookies'`
+        ).first<{ updated_at: string }>();
+        return json({ configured: !!row, updated_at: row?.updated_at ?? null });
+      }
+
       return err("Not found", 404);
     } catch (e) {
       return err(`Server error: ${(e as Error).message}`, 500);
