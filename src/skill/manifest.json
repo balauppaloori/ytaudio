@@ -1,0 +1,54 @@
+{
+  "name": "ytaudio-search",
+  "version": "1.0.0",
+  "description": "Search the YTAudio library — transcribed YouTube audio across all channels",
+  "tools": [
+    {
+      "name": "ytaudio_search",
+      "description": "Search transcribed YouTube audio by keyword or phrase. Returns matching tracks with title, channel, date, and transcript snippet.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "The keyword or phrase to search for in transcripts and titles"
+          },
+          "channel": {
+            "type": "string",
+            "description": "Optional: filter by channel ID to restrict search to a specific channel"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Max results to return (default 10, max 50)"
+          }
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "name": "ytaudio_list_channels",
+      "description": "List all channels in the YTAudio library with their track counts.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "ytaudio_list_tracks",
+      "description": "List recent tracks from the YTAudio library, optionally filtered by channel.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "channel": {
+            "type": "string",
+            "description": "Optional channel ID to filter tracks"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Max tracks to return (default 10)"
+          }
+        }
+      }
+    }
+  ]
+}

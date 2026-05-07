@@ -1,0 +1,12 @@
+name = "ytaudio-api"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ytaudio-db"
+database_id = "1a26171f-699b-44f2-84c1-aa453f238a42"
+
+[vars]
+WORKER_SECRET = "ytaudio-internal-2026"
