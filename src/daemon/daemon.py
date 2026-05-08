@@ -82,7 +82,12 @@ def sync_cookies(client: httpx.Client):
 
 
 def ydl_base() -> dict:
-    opts = {"quiet": True, "no_warnings": True, "format": "bestaudio/best"}
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "bestaudio/best",
+        "js_runtimes": ["node:/usr/bin/node"],
+    }
     if os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
     return opts
