@@ -86,7 +86,7 @@ def ydl_base() -> dict:
         "quiet": True,
         "no_warnings": True,
         "format": "bestaudio/best",
-        "js_runtimes": ["node:/usr/bin/node"],
+        "js_runtimes": {"node": {"path": "/usr/bin/node"}},
     }
     if os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
